@@ -21,7 +21,7 @@
  ****************************************************************/
 
 // Helper compiler definitions
-#define barrier() __asm__ __volatile__("": : :"memory")
+#define barrier()       __DMB()  // ARM Cortex-M "Data Memory Barrier"
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
@@ -647,14 +647,19 @@ tx_schedule_transmit(struct can2040 *cd)
     if (cd->tx_state == TS_QUEUED && !pio_tx_did_fail(cd))
         // Already queued or actively transmitting
         return 0;
-    if (cd->tx_push_pos == cd->tx_pull_pos) {
+    uint32_t tx_pull_pos = cd->tx_pull_pos;
+    if (readl(&cd->tx_push_pos) == tx_pull_pos) {
         // No new messages to transmit
         cd->tx_state = TS_IDLE;
         pio_signal_clear_txpending(cd);
-        return SI_TXPENDING;
+        barrier();
+        if (likely(readl(&cd->tx_push_pos) == tx_pull_pos))
+            return SI_TXPENDING;
+        // Raced with can2040_transmit() - msg is now available for transmit
+        pio_signal_set_txpending(cd);
     }
     cd->tx_state = TS_QUEUED;
-    struct can2040_transmit *qt = &cd->tx_queue[tx_qpos(cd, cd->tx_pull_pos)];
+    struct can2040_transmit *qt = &cd->tx_queue[tx_qpos(cd, tx_pull_pos)];
     pio_tx_send(cd, qt->stuffed_data, qt->stuffed_words);
     return 0;
 }
@@ -717,7 +722,7 @@ report_callback_rx_msg(struct can2040 *cd)
 static void
 report_callback_tx_msg(struct can2040 *cd)
 {
-    cd->tx_pull_pos++;
+    writel(&cd->tx_pull_pos, cd->tx_pull_pos + 1);
     cd->rx_cb(cd, CAN2040_NOTIFY_TX, &cd->parse_msg);
 }
 
@@ -1256,6 +1261,7 @@ can2040_transmit(struct can2040 *cd, struct can2040_msg *msg)
     writel(&cd->tx_push_pos, tx_push_pos + 1);
 
     // Wakeup if in TS_IDLE state
+    barrier();
     pio_signal_set_txpending(cd);
 
     return 0;
